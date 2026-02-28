@@ -1,0 +1,11 @@
+# data / model
+data_dir/
+model_dir/
+
+# wandb logs
+wandb/
+RLHF/wandb/
+
+# optional
+__pycache__/
+*.pyc
