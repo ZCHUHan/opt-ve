@@ -29,8 +29,8 @@ export WANDB_ENTITY="zhang-c-de42-institue-of-science-tokyo"  # Replace with you
 # TRAINING CONFIG
 NUM_EPOCHS=1
 LEARNING_RATE=2e-5
-BATCH_SIZE=8
-GRAD_ACCUMULATION=1
+BATCH_SIZE=4
+GRAD_ACCUMULATION=2
 
 torchrun \
     --standalone \

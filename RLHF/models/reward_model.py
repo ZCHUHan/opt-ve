@@ -284,6 +284,13 @@ class RewardModel(transformers.PreTrainedModel):
             )
         if action_placeholder_id is None:
             action_placeholder_id = self.action_placeholder_id
+        if action_placeholder_id is not None:
+            vocab_size = self.backbone_model.get_input_embeddings().weight.shape[0]
+            if action_placeholder_id < 0 or action_placeholder_id >= vocab_size:
+                raise ValueError(
+                    f"action_placeholder_id={action_placeholder_id} is out of vocab "
+                    f"range [0, {vocab_size - 1}]."
+                )
 
         backbone_extra_kwargs = {}
         if action_embeds is not None:
