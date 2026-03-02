@@ -141,7 +141,13 @@ class RewardModelOutput(ModelOutput):
 
 
 class ActionSoftEmbedder(nn.Module):
-    """Differentiable mapping from continuous action values to token embeddings."""
+    """Differentiable mapping from continuous action values to token embeddings.
+
+    Uses Gaussian softmax over bin centers (test-time inject style): for each
+    action dimension, weights = softmax(-0.5 * (action - bin_centers)^2 / sigma^2),
+    then action_embed = sum_k weights[k] * embed(token_k). This is consistent with
+    the DifferentiableRobotRewardModel / test-time inject flow.
+    """
 
     def __init__(
         self,
@@ -150,31 +156,33 @@ class ActionSoftEmbedder(nn.Module):
         action_token_end: int = 31999,
         action_value_min: Optional[float] = None,
         action_value_max: Optional[float] = None,
+        action_sigma: Optional[float] = None,
     ):
         super().__init__()
         if action_token_end < action_token_start:
             raise ValueError("action_token_end must be >= action_token_start")
-        if (
-            action_value_min is not None
-            and action_value_max is not None
-            and action_value_max <= action_value_min
-        ):
+
+        min_val = action_value_min if action_value_min is not None else -1.0
+        max_val = action_value_max if action_value_max is not None else 1.0
+        if max_val <= min_val:
             raise ValueError("action_value_max must be greater than action_value_min")
 
         self.action_dim = action_dim
         self.action_token_start = action_token_start
         self.action_token_end = action_token_end
         self.num_bins = action_token_end - action_token_start + 1
-        self.action_value_min = action_value_min
-        self.action_value_max = action_value_max
+        self.action_value_min = min_val
+        self.action_value_max = max_val
+        self._action_sigma = action_sigma  # None -> use bin width in forward
 
-    def _to_bin_coordinate(self, action_continuous: Tensor) -> Tensor:
-        action = action_continuous.float()
-        if self.action_value_min is None or self.action_value_max is None:
-            return action - float(self.action_token_start)
-
-        denom = max(self.action_value_max - self.action_value_min, 1e-6)
-        return (action - self.action_value_min) * (self.num_bins - 1) / denom
+        # Bin centers: one per token in [action_token_start, action_token_end]
+        bin_centers = torch.linspace(min_val, max_val, self.num_bins, dtype=torch.float32)
+        self.register_buffer("bin_centers", bin_centers)
+        # Token IDs for each bin: [action_token_start, ..., action_token_end]
+        action_token_ids = torch.arange(
+            action_token_start, action_token_end + 1, dtype=torch.long
+        )
+        self.register_buffer("action_token_ids", action_token_ids)
 
     def forward(self, action_continuous: Tensor, token_embedding_weight: Tensor) -> Tensor:
         if action_continuous.dim() != 2:
@@ -187,25 +195,33 @@ class ActionSoftEmbedder(nn.Module):
                 f"got {action_continuous.size(-1)}"
             )
 
-        bin_coordinate = self._to_bin_coordinate(action_continuous)
-        max_bin = float(self.num_bins - 1) - 1e-6
-        bin_coordinate = torch.clamp(bin_coordinate, min=0.0, max=max_bin)
+        device = token_embedding_weight.device
+        dtype = token_embedding_weight.dtype
+        action = action_continuous.float().to(device=device)
+        action = torch.clamp(action, self.action_value_min, self.action_value_max)
 
-        lower_bin = torch.floor(bin_coordinate)
-        upper_bin = torch.clamp(lower_bin + 1.0, max=float(self.num_bins - 1))
-        frac = (bin_coordinate - lower_bin).unsqueeze(-1)
+        centers = self.bin_centers.to(device=device)
+        sigma = self._action_sigma
+        if sigma is None:
+            bin_width = (
+                float(centers[1] - centers[0])
+                if self.num_bins > 1
+                else 1.0
+            )
+            sigma = max(1e-6, bin_width)
+        sigma = torch.tensor(sigma, device=device, dtype=torch.float32)
 
-        lower_ids = (lower_bin.long() + self.action_token_start).to(
-            device=token_embedding_weight.device
-        )
-        upper_ids = (upper_bin.long() + self.action_token_start).to(
-            device=token_embedding_weight.device
-        )
+        # diff: [B, action_dim, num_bins]
+        diff = action.unsqueeze(-1) - centers.unsqueeze(0).unsqueeze(0)
+        weights = F.softmax(-0.5 * (diff / sigma).pow(2), dim=-1)
 
-        lower_embed = F.embedding(lower_ids, token_embedding_weight)
-        upper_embed = F.embedding(upper_ids, token_embedding_weight)
-        frac = frac.to(dtype=lower_embed.dtype, device=lower_embed.device)
-        return (1.0 - frac) * lower_embed + frac * upper_embed
+        token_ids = self.action_token_ids.to(device=device)
+        token_embeds = F.embedding(token_ids, token_embedding_weight)
+        token_embeds = token_embeds.to(dtype=dtype)
+
+        # weights [B, action_dim, num_bins], token_embeds [num_bins, hidden] -> [B, action_dim, hidden]
+        action_embeds = torch.matmul(weights, token_embeds)
+        return action_embeds
 
 
 class RewardModel(transformers.PreTrainedModel):
@@ -244,6 +260,7 @@ class RewardModel(transformers.PreTrainedModel):
             action_token_end=kwargs.get("action_token_end", 31999),
             action_value_min=kwargs.get("action_value_min", None),
             action_value_max=kwargs.get("action_value_max", None),
+            action_sigma=kwargs.get("action_sigma", None),
         )
 
         if checkpoint_dir is not None:
@@ -480,22 +497,28 @@ class RewardModelTrainer(transformers.Trainer):
         )
         energy_pred = outputs.rewards
         energy_pred = energy_pred.squeeze(-1) if energy_pred.dim() > 1 else energy_pred
-        rmse = rmse.to(dtype=energy_pred.dtype, device=energy_pred.device)
+        rmse = rmse.to(device=energy_pred.device)
 
-        loss_main = F.smooth_l1_loss(energy_pred, rmse)
-        grad_a = torch.autograd.grad(
-            outputs=energy_pred.sum(),
-            inputs=action_continuous,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        grad_norm = torch.norm(grad_a, p=2, dim=-1)
-        gp_cap = float(getattr(self.args, "gp_cap", 1.0))
-        lambda_gp = float(getattr(self.args, "lambda_gp", 0.1))
-        loss_gp = F.relu(grad_norm - gp_cap).pow(2).mean()
+        # smooth_l1_loss 在 CUDA 上不支援 BFloat16，改用 float32 計算 loss
+        loss_main = F.smooth_l1_loss(energy_pred.float(), rmse.float())
 
-        loss = loss_main + lambda_gp * loss_gp
+        # Eval 時無計算圖，不計算 gradient penalty，避免 autograd.grad 報錯
+        if torch.is_grad_enabled():
+            grad_a = torch.autograd.grad(
+                outputs=energy_pred.sum(),
+                inputs=action_continuous,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+            grad_norm = torch.norm(grad_a.float(), p=2, dim=-1)
+            gp_cap = float(getattr(self.args, "gp_cap", 1.0))
+            lambda_gp = float(getattr(self.args, "lambda_gp", 0.1))
+            loss_gp = F.relu(grad_norm - gp_cap).pow(2).mean()
+            loss = loss_main + lambda_gp * loss_gp
+        else:
+            loss = loss_main
+
         logged_energy = energy_pred.unsqueeze(-1)
         return (loss, dict(logits=logged_energy)) if return_outputs else loss
 
@@ -584,6 +607,7 @@ def load_4bit_reward_model_for_inference(
     action_token_end: int = 31999,
     action_value_min: Optional[float] = None,
     action_value_max: Optional[float] = None,
+    action_sigma: Optional[float] = None,
     action_placeholder_id: Optional[int] = None,
 ):
     # Load the model.
@@ -628,6 +652,7 @@ def load_4bit_reward_model_for_inference(
         action_token_end=action_token_end,
         action_value_min=action_value_min,
         action_value_max=action_value_max,
+        action_sigma=action_sigma,
         action_placeholder_id=action_placeholder_id,
     )
     return model

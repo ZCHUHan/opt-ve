@@ -6,7 +6,7 @@ set -x
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export DATA_DIR="$HOME/monkey-verifier/data_dir"
 export MODEL_DIR="$HOME/monkey-verifier/model_dir"
-export LLAVA_SRC_DIR="$HOME/monkey-verifier/monkey-verifier/llava_setup/LLaVA"
+export LLAVA_SRC_DIR="$HOME/monkey-verifier/llava_setup/LLaVA"
 export PYTHONPATH="$LLAVA_SRC_DIR:$PWD:$PYTHONPATH"
 export GPUS_PER_NODE=8
 export OMP_NUM_THREADS=1
