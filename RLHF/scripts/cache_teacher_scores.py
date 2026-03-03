@@ -43,6 +43,13 @@ def main():
         help="Same reward prompt file used during energy RM training.",
     )
     ap.add_argument("--fp", choices=["bf16", "fp16"], default="bf16")
+    ap.add_argument(
+        "--bits",
+        type=int,
+        choices=[4, 8, 16],
+        default=16,
+        help="Teacher load precision. 16 means non-quantized weights (recommended for caching speed if VRAM allows).",
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -87,7 +94,7 @@ def main():
         lora_modules=None,
         image_aspect_ratio=args.image_aspect_ratio,
         image_grid_pinpoints=None,
-        bits=4,
+        bits=args.bits,
         fp16=(args.fp == "fp16"),
         bf16=(args.fp == "bf16"),
         double_quant=True,
@@ -108,7 +115,7 @@ def main():
         config=cfg,
         checkpoint_dir=args.teacher_ckpt,
         tokenizer=tokenizer,
-        qlora=True,
+        qlora=(args.bits in (4, 8)),
         is_trainable=False,
         action_dim=args.action_dim,
         action_placeholder_id=action_placeholder_id,
