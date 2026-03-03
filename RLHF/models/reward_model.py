@@ -220,6 +220,8 @@ class ActionSoftEmbedder(nn.Module):
         token_embeds = token_embeds.to(dtype=dtype)
 
         # weights [B, action_dim, num_bins], token_embeds [num_bins, hidden] -> [B, action_dim, hidden]
+        # Convert weights to match token_embeds dtype for matmul
+        weights = weights.to(dtype=dtype)
         action_embeds = torch.matmul(weights, token_embeds)
         return action_embeds
 
@@ -380,6 +382,184 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 class RewardModelTrainer(transformers.Trainer):
+# in RewardModelTrainer
+    def __init__(self, *args, teacher_model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.teacher_model = teacher_model
+        if self.teacher_model is not None:
+            self.teacher_model.eval()
+            for p in self.teacher_model.parameters():
+                p.requires_grad_(False)
+
+    def _compute_energy_kd_score_loss(self, model, inputs, return_outputs=False):
+        input_ids, attention_mask, action_continuous, rmse = unpack_dict(
+            inputs, keys=("input_ids","attention_mask","action_continuous","rmse")
+        )
+        images = inputs.get("images", None)
+
+        # ---- (A) get placeholder id
+        action_placeholder_id = getattr(self.args, "action_placeholder_id", None)
+        if action_placeholder_id is None and hasattr(model, "action_placeholder_id"):
+            action_placeholder_id = model.action_placeholder_id
+
+        # ---- (B) sigma schedules (optional but recommended)
+        # student sigma anneal
+        if hasattr(model, "action_soft_embedder"):
+            s0 = float(getattr(self.args, "student_sigma_init", 0.0) or 0.0)
+            s1 = float(getattr(self.args, "student_sigma_final", 0.0) or 0.0)
+            T  = int(getattr(self.args, "sigma_anneal_steps", 0) or 0)
+            if T > 0 and s0 > 0 and s1 > 0:
+                t = min(1.0, self.state.global_step / float(T))
+                model.action_soft_embedder._action_sigma = (1 - t) * s0 + t * s1
+
+        # teacher sigma tiny (hard-approx)
+        if self.teacher_model is not None and hasattr(self.teacher_model, "action_soft_embedder"):
+            ts = float(getattr(self.args, "teacher_sigma", 0.0) or 0.0)
+            if ts > 0:
+                self.teacher_model.action_soft_embedder._action_sigma = ts
+
+        # ---- (C) forward on GT (student)
+        a_gt = action_continuous
+        out_s_gt = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=images,
+            action_continuous=a_gt,
+            action_placeholder_id=action_placeholder_id,
+        )
+        E_s_gt = out_s_gt.rewards
+        E_s_gt = E_s_gt.squeeze(-1) if E_s_gt.dim() > 1 else E_s_gt
+
+        rmse = rmse.to(device=E_s_gt.device)
+        loss_main = F.smooth_l1_loss(E_s_gt.float(), rmse.float())
+
+        # ---- (D) KD on GT (teacher or offline teacher scores)
+        lambda_kd = float(getattr(self.args, "lambda_kd", 0.0))
+        loss_kd = torch.zeros([], device=E_s_gt.device)
+        if lambda_kd > 0:
+            # Prefer offline teacher scores if provided in the batch.
+            teacher_score = inputs.get("teacher_score", None)
+            if teacher_score is not None:
+                E_t_gt = teacher_score.to(device=E_s_gt.device, dtype=E_s_gt.dtype)
+                # z-score KD is much stabler than raw MSE when scales differ
+                eps = 1e-6
+                s = (E_s_gt.float() - E_s_gt.float().mean()) / (
+                    E_s_gt.float().std(unbiased=False) + eps
+                )
+                t = (E_t_gt.float() - E_t_gt.float().mean()) / (
+                    E_t_gt.float().std(unbiased=False) + eps
+                )
+                loss_kd = F.smooth_l1_loss(s, t)
+            elif self.teacher_model is not None:
+                with torch.inference_mode():
+                    out_t = self.teacher_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        images=images,
+                        action_continuous=a_gt,
+                        action_placeholder_id=action_placeholder_id,
+                    )
+                    E_t_gt = out_t.rewards
+                    E_t_gt = (
+                        E_t_gt.squeeze(-1) if E_t_gt.dim() > 1 else E_t_gt
+                    )
+
+                # z-score KD is much stabler than raw MSE when scales differ
+                eps = 1e-6
+                s = (E_s_gt.float() - E_s_gt.float().mean()) / (
+                    E_s_gt.float().std(unbiased=False) + eps
+                )
+                t = (E_t_gt.float() - E_t_gt.float().mean()) / (
+                    E_t_gt.float().std(unbiased=False) + eps
+                )
+                loss_kd = F.smooth_l1_loss(s, t)
+
+        # ---- (E) sample noise actions around GT
+        a_gt_f = a_gt.float()
+        noise_std = float(getattr(self.args, "noise_std", 0.05))
+        a_noise = (a_gt_f + noise_std * torch.randn_like(a_gt_f)).detach().requires_grad_(True)
+
+        # clamp to embedder range if you set min/max (optional)
+        if hasattr(model, "action_soft_embedder"):
+            amin = float(model.action_soft_embedder.action_value_min)
+            amax = float(model.action_soft_embedder.action_value_max)
+            a_noise.data.clamp_(amin, amax)
+
+        out_s_n = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=images,
+            action_continuous=a_noise,
+            action_placeholder_id=action_placeholder_id,
+        )
+        E_s_n = out_s_n.rewards
+        E_s_n = E_s_n.squeeze(-1) if E_s_n.dim() > 1 else E_s_n
+
+        # ---- (F) local bowl pseudo-target (optional)
+        lambda_local = float(getattr(self.args, "lambda_local", 0.0))
+        beta_dist = float(getattr(self.args, "beta_dist", 1.0))
+        loss_local = torch.zeros([], device=E_s_gt.device)
+        if lambda_local > 0:
+            # target: rmse_gt + beta * ||a_noise - a_gt||^2
+            dist2 = torch.sum((a_noise - a_gt_f) ** 2, dim=-1)
+            target_n = rmse.float() + beta_dist * dist2
+            loss_local = F.mse_loss(E_s_n.float(), target_n)
+
+        # ---- (G) score matching / gradient matching (core)
+        lambda_score = float(getattr(self.args, "lambda_score", 0.0))
+        loss_score = torch.zeros([], device=E_s_gt.device)
+        grad_norm = torch.zeros([], device=E_s_gt.device)
+
+        if torch.is_grad_enabled() and lambda_score > 0:
+            grad_a = torch.autograd.grad(
+                outputs=E_s_n.float().sum(),
+                inputs=a_noise,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]  # [B,D]
+
+            grad_norm = torch.norm(grad_a, p=2, dim=-1).mean()
+
+            # For energy bowl: want ∇E ≈ (a_noise - a_gt) / sigma_n^2
+            sigma_n = float(getattr(self.args, "score_sigma", noise_std))
+            sigma_n = max(sigma_n, 1e-6)
+            target_grad = (a_noise - a_gt_f) / (sigma_n ** 2)
+
+            loss_score = F.mse_loss(grad_a, target_grad)
+
+        # ---- (H) keep your existing capped GP (optional)
+        lambda_gp = float(getattr(self.args, "lambda_gp", 0.0))
+        gp_cap = float(getattr(self.args, "gp_cap", 1.0))
+        loss_gp = torch.zeros([], device=E_s_gt.device)
+
+        if torch.is_grad_enabled() and lambda_gp > 0:
+            # reuse grad_a if exists; otherwise compute on GT
+            if lambda_score > 0:
+                g = torch.norm(grad_a.float(), p=2, dim=-1)
+            else:
+                grad_gt = torch.autograd.grad(
+                    outputs=E_s_gt.float().sum(),
+                    inputs=a_gt_f.detach().requires_grad_(True),
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )[0]
+                g = torch.norm(grad_gt.float(), p=2, dim=-1)
+            loss_gp = F.relu(g - gp_cap).pow(2).mean()
+
+        total_loss = loss_main + lambda_kd * loss_kd + lambda_local * loss_local + lambda_score * loss_score + lambda_gp * loss_gp
+
+        logs = {
+            "loss_main": loss_main.detach(),
+            "loss_kd": loss_kd.detach(),
+            "loss_local": loss_local.detach(),
+            "loss_score": loss_score.detach(),
+            "loss_gp": loss_gp.detach(),
+            "grad_norm_mean": grad_norm.detach(),
+        }
+        return (total_loss, dict(logits=E_s_gt.detach().unsqueeze(-1), **logs)) if return_outputs else total_loss
+
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
             # Save the model
@@ -523,22 +703,12 @@ class RewardModelTrainer(transformers.Trainer):
         return (loss, dict(logits=logged_energy)) if return_outputs else loss
 
     def compute_loss(self, model, inputs, return_outputs=False, alpha=0.1):
-        """
-        Computes the loss for the reward model training.
-        """
         loss_type = getattr(self.args, "rm_loss_type", "pairwise")
+        if loss_type == "energy_kd_score":
+            return self._compute_energy_kd_score_loss(model, inputs, return_outputs=return_outputs)
         if loss_type == "energy":
-            return self._compute_energy_loss(
-                model=model,
-                inputs=inputs,
-                return_outputs=return_outputs,
-            )
-        return self._compute_pairwise_loss(
-            model=model,
-            inputs=inputs,
-            return_outputs=return_outputs,
-            alpha=alpha,
-        )
+            return self._compute_energy_loss(model, inputs, return_outputs=return_outputs)
+        return self._compute_pairwise_loss(model, inputs, return_outputs=return_outputs, alpha=alpha)
 
 
 def compute_reward_modeling_metrics(eval_prediction: EvalPrediction) -> Dict:

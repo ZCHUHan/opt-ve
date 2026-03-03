@@ -67,8 +67,13 @@ def get_accelerate_model(
     )
 
     if checkpoint_dir is not None:
+        # Support different checkpoint structures:
+        # 1. checkpoint_dir/adapter_model
+        # 2. checkpoint_dir/lora_adapter/adapter_model
         if exists(join(checkpoint_dir, "adapter_model")):
             checkpoint_dir = join(checkpoint_dir, "adapter_model")
+        elif exists(join(checkpoint_dir, "lora_adapter", "adapter_model")):
+            checkpoint_dir = join(checkpoint_dir, "lora_adapter", "adapter_model")
 
         if exists(join(checkpoint_dir, "lora_default")):
             checkpoint_dir = join(checkpoint_dir, "lora_default")
@@ -235,8 +240,13 @@ def load_4bit_model_for_inference(
     trust_remote_code=False,
 ):
     if checkpoint_dir is not None:
+        # Support different checkpoint structures:
+        # 1. checkpoint_dir/adapter_model
+        # 2. checkpoint_dir/lora_adapter/adapter_model
         if exists(join(checkpoint_dir, "adapter_model")):
             checkpoint_dir = join(checkpoint_dir, "adapter_model")
+        elif exists(join(checkpoint_dir, "lora_adapter", "adapter_model")):
+            checkpoint_dir = join(checkpoint_dir, "lora_adapter", "adapter_model")
 
         if exists(join(checkpoint_dir, "lora_default")):
             checkpoint_dir = join(checkpoint_dir, "lora_default")

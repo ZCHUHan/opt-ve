@@ -8,6 +8,7 @@ export DATA_DIR="$HOME/monkey-verifier/data_dir"
 export MODEL_DIR="$HOME/monkey-verifier/model_dir"
 export LLAVA_SRC_DIR="$HOME/monkey-verifier/llava_setup/LLaVA"
 export PYTHONPATH="$LLAVA_SRC_DIR:$PWD:$PYTHONPATH"
+# GPUS_PER_NODE should match the number of GPUs in CUDA_VISIBLE_DEVICES
 export GPUS_PER_NODE=8
 export OMP_NUM_THREADS=1
 
@@ -21,6 +22,11 @@ PREFERENCE_DATA=action_preference_bridge/action_preference_bridge.json
 # SAVE CONFIG
 MODEL_NAME=Monkey-Verifier-7B-Energy
 
+# TEACHER CONFIG (for knowledge distillation)
+TEACHER_DIR=Monkey-Verifier-teacher
+# Optional: precomputed teacher scores for offline KD (set after running cache_teacher_scores.py)
+# TEACHER_SCORE_PATH=$MODEL_DIR/Monkey-Verifier-7B-Energy/teacher_scores.pt
+
 # WANDB CONFIG
 export WANDB_PROJECT="bridge-energy"
 export WANDB_NAME="$MODEL_NAME-$(date +%Y%m%d_%H%M%S)"
@@ -29,8 +35,8 @@ export WANDB_ENTITY="zhang-c-de42-institue-of-science-tokyo"  # Replace with you
 # TRAINING CONFIG
 NUM_EPOCHS=1
 LEARNING_RATE=2e-5
-BATCH_SIZE=4
-GRAD_ACCUMULATION=2
+BATCH_SIZE=2
+GRAD_ACCUMULATION=4
 
 torchrun \
     --standalone \
@@ -59,7 +65,18 @@ torchrun \
     --dataset_name "none" \
     --eval_dataset_name "none" \
     --eval_size 1024 \
-    --rm_loss_type "energy" \
+    --rm_loss_type "energy_kd_score" \
+    --teacher_dir "$MODEL_DIR/$TEACHER_DIR" \
+    --lambda_kd 1.0 \
+    --lambda_local 1.0 \
+    --lambda_score 0.1 \
+    --teacher_sigma 0.005 \
+    --student_sigma_init 0.005 \
+    --student_sigma_final 0.05 \
+    --sigma_anneal_steps 2000 \
+    --noise_std 0.05 \
+    --beta_dist 1.0 \
+    --score_sigma 0.05 \
     --lambda_gp 0.1 \
     --gp_cap 1.0 \
     --action_placeholder_token "<ACT>" \
@@ -91,4 +108,5 @@ torchrun \
     --resume_from_training True \
     --reward_prompt_file "./prompts/robot_reward_prompt.txt" \
     --image_aspect_ratio 'pad' \
-    --run_name "$WANDB_NAME"
+    --run_name "$WANDB_NAME" \
+    ${TEACHER_SCORE_PATH:+--teacher_score_path "$TEACHER_SCORE_PATH"}

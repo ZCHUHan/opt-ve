@@ -153,6 +153,26 @@ class EnergyRewardModelingDataset(Dataset):
             for key in ("output_1", "output_2", "nrmse_0", "nrmse_1")
         ) and ("action" not in first_sample or "rmse" not in first_sample)
 
+        # Optional: pre-computed teacher scores for offline KD.
+        # Expect a 1D tensor of length equal to len(self) (after any pairwise expansion).
+        self.teacher_scores = None
+        teacher_score_path = getattr(self.data_args, "teacher_score_path", None)
+        if teacher_score_path:
+            teacher_scores = torch.load(teacher_score_path, map_location="cpu")
+            if isinstance(teacher_scores, dict) and "scores" in teacher_scores:
+                teacher_scores = teacher_scores["scores"]
+            teacher_scores = torch.as_tensor(teacher_scores, dtype=torch.float32)
+            # Flatten in case it's accidentally saved as shape [N, 1].
+            if teacher_scores.dim() > 1:
+                teacher_scores = teacher_scores.view(-1)
+            self.teacher_scores = teacher_scores
+
+            if len(self.teacher_scores) != len(self):
+                raise ValueError(
+                    f"teacher_scores length {len(self.teacher_scores)} != dataset length {len(self)}. "
+                    "Make sure teacher_score_path matches dataset_path and energy_expand_pairwise_samples."
+                )
+
     def __len__(self):
         if self.source_is_pairwise and self.expand_pairwise_samples:
             return len(self.list_data_dict) * 2
@@ -233,6 +253,10 @@ class EnergyRewardModelingDataset(Dataset):
             rmse=torch.tensor(rmse, dtype=torch.float32),
         )
 
+        # Attach offline teacher score if available.
+        if self.teacher_scores is not None:
+            data_dict["teacher_score"] = self.teacher_scores[i].to(torch.float32)
+
         if "image" in sample:
             data_dict["image"] = image.to(torch.bfloat16)
         elif self.data_args.is_multimodal:
@@ -301,6 +325,12 @@ class DataCollatorForEnergyRewardModelingDataset(object):
             action_continuous=action_continuous,
             rmse=rmse,
         )
+
+        # Optional offline teacher scores for KD.
+        if "teacher_score" in instances[0]:
+            batch["teacher_score"] = torch.stack(
+                [instance["teacher_score"] for instance in instances]
+            ).view(-1)
 
         if "image" in instances[0]:
             images = [instance["image"] for instance in instances]

@@ -95,10 +95,31 @@ class DataArguments:
     action_dim: int = field(default=7)
     action_placeholder_token: str = field(default="<ACT>")
     energy_expand_pairwise_samples: bool = field(default=True)
+    # Optional: path to pre-computed teacher scores for offline KD.
+    teacher_score_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a .pt tensor of pre-computed teacher scores for offline KD."
+        },
+    )
 
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
+    # in TrainingArguments
+    rm_loss_type: str = field(default="energy_kd_score")
+    lambda_kd: float = field(default=1.0)
+    lambda_local: float = field(default=1.0)
+    lambda_score: float = field(default=0.1)
+    noise_std: float = field(default=0.05)
+    beta_dist: float = field(default=1.0)
+    teacher_sigma: float = field(default=0.005)        # hard-approx
+    student_sigma_init: float = field(default=0.005)   # start near hard
+    student_sigma_final: float = field(default=0.05)   # your inference sigma
+    sigma_anneal_steps: int = field(default=2000)
+    score_sigma: float = field(default=0.05)
+    teacher_dir: Optional[str] = field(default=None)   # frozen teacher ckpt (optional)
+    
     cache_dir: Optional[str] = field(default=None)
     # From LLaVA
     remove_unused_columns: bool = field(default=False)
@@ -276,7 +297,11 @@ def train():
     if completed_training:
         rank0_print("Detected that training was already completed!")
 
-    if checkpoint_dir is None:
+    # If training from scratch and teacher_dir is provided, initialize student from teacher
+    if checkpoint_dir is None and training_args.teacher_dir is not None:
+        checkpoint_dir = training_args.teacher_dir
+        rank0_print("Initializing student model from teacher checkpoint:", checkpoint_dir)
+    elif checkpoint_dir is None:
         rank0_print("Training from scratch.")
     else:
         rank0_print("Loading from checkpoint:", checkpoint_dir)
@@ -407,8 +432,57 @@ def train():
     print("loaded model")
     set_seed(args.seed)
 
+    # Optionally load teacher model for online KD.
+    # If offline teacher scores are provided, we skip loading the teacher to save VRAM.
+    teacher = None
+    use_online_teacher = (
+        training_args.rm_loss_type == "energy_kd_score"
+        and float(getattr(training_args, "lambda_kd", 0.0)) > 0.0
+        and getattr(data_args, "teacher_score_path", None) is None
+    )
+    if use_online_teacher:
+        teacher_ckpt = training_args.teacher_dir or checkpoint_dir
+        teacher = RewardModel(
+            args=args,
+            config=config,
+            qlora=True,
+            checkpoint_dir=teacher_ckpt,
+            tokenizer=tokenizer,
+            action_dim=data_args.action_dim,
+            action_placeholder_id=action_placeholder_id,
+            action_token_start=training_args.action_token_start,
+            action_token_end=training_args.action_token_end,
+            action_value_min=training_args.action_value_min,
+            action_value_max=training_args.action_value_max,
+            reward_output_activation=training_args.reward_output_activation,
+            is_trainable=False,
+        ).to(torch.bfloat16)
+
+        # Resize teacher model's token embeddings to match tokenizer (in case new tokens were added)
+        if num_added_action_tokens > 0:
+            teacher.backbone_model.resize_token_embeddings(len(tokenizer))
+            input_embeddings = teacher.backbone_model.get_input_embeddings().weight.data
+            input_embeddings_avg = input_embeddings[:-num_added_action_tokens].mean(
+                dim=0, keepdim=True
+            )
+            input_embeddings[-num_added_action_tokens:] = input_embeddings_avg
+            output_embeddings = teacher.backbone_model.get_output_embeddings()
+            if output_embeddings is not None:
+                output_embeddings_weight = output_embeddings.weight.data
+                output_embeddings_avg = output_embeddings_weight[
+                    :-num_added_action_tokens
+                ].mean(dim=0, keepdim=True)
+                output_embeddings_weight[-num_added_action_tokens:] = (
+                    output_embeddings_avg
+                )
+
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+
     trainer = Trainer(
         model=model,
+        teacher_model=teacher,
         tokenizer=tokenizer,
         args=training_args,
         compute_metrics=compute_energy_modeling_metrics,
