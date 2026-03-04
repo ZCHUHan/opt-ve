@@ -19,6 +19,7 @@ import os
 from typing import Optional, Dict, Sequence, Union
 
 import einops
+import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -574,7 +575,16 @@ class RewardModelTrainer(transformers.Trainer):
             "loss_gp": loss_gp.detach(),
             "grad_norm_mean": grad_norm.detach(),
         }
-        return (total_loss, dict(logits=E_s_gt.detach().unsqueeze(-1), **logs)) if return_outputs else total_loss
+        # Keep component logs for training diagnostics, but do not expose them
+        # as prediction tensors (it breaks eval collation due heterogeneous shapes).
+        if model.training:
+            logging_steps = max(1, int(getattr(self.args, "logging_steps", 10)))
+            if self.state.global_step % logging_steps == 0:
+                self.log({k: float(v.float().item()) for k, v in logs.items()})
+
+        if return_outputs:
+            return total_loss, dict(logits=E_s_gt.detach().unsqueeze(-1))
+        return total_loss
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -745,11 +755,16 @@ def compute_reward_modeling_metrics(eval_prediction: EvalPrediction) -> Dict:
 
 
 def compute_energy_modeling_metrics(eval_prediction: EvalPrediction) -> Dict:
-    predictions = torch.tensor(eval_prediction.predictions).squeeze(-1).float()
+    preds = eval_prediction.predictions
+    if isinstance(preds, (tuple, list)):
+        preds = preds[0]
+    preds = np.asarray(preds)
+    predictions = torch.as_tensor(preds).squeeze(-1).float()
     labels = eval_prediction.label_ids
     if isinstance(labels, tuple):
         labels = labels[0]
-    labels = torch.tensor(labels).squeeze(-1).float()
+    labels = np.asarray(labels)
+    labels = torch.as_tensor(labels).squeeze(-1).float()
 
     mse = F.mse_loss(predictions, labels).item()
     mae = torch.mean(torch.abs(predictions - labels)).item()
