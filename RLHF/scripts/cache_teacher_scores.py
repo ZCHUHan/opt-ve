@@ -35,6 +35,10 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--action_dim", type=int, default=7)
     ap.add_argument("--action_placeholder_token", default="<ACT>")
+    ap.add_argument("--action_token_start", type=int, default=31744)
+    ap.add_argument("--action_token_end", type=int, default=31999)
+    ap.add_argument("--action_value_min", type=float, default=-1.0)
+    ap.add_argument("--action_value_max", type=float, default=1.0)
     ap.add_argument("--image_aspect_ratio", default="square")
     ap.add_argument("--energy_expand_pairwise_samples", action="store_true")
     ap.add_argument(
@@ -103,10 +107,10 @@ def main():
         full_finetune=False,
         gradient_checkpointing=False,
         action_placeholder_id=action_placeholder_id,
-        action_token_start=31744,
-        action_token_end=31999,
-        action_value_min=None,
-        action_value_max=None,
+        action_token_start=args.action_token_start,
+        action_token_end=args.action_token_end,
+        action_value_min=args.action_value_min,
+        action_value_max=args.action_value_max,
         reward_output_activation="identity",  # teacher_score 用 raw 更稳
     )
 

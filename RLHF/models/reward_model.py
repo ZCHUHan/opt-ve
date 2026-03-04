@@ -200,7 +200,9 @@ class ActionSoftEmbedder(nn.Module):
         action = action_continuous.float().to(device=device)
         action = torch.clamp(action, self.action_value_min, self.action_value_max)
 
-        centers = self.bin_centers.to(device=device)
+        # Clone buffers so DDP buffer broadcasts between multiple forwards in one
+        # training step do not bump version counters on saved tensors.
+        centers = self.bin_centers.to(device=device).clone()
         sigma = self._action_sigma
         if sigma is None:
             bin_width = (
@@ -215,7 +217,7 @@ class ActionSoftEmbedder(nn.Module):
         diff = action.unsqueeze(-1) - centers.unsqueeze(0).unsqueeze(0)
         weights = F.softmax(-0.5 * (diff / sigma).pow(2), dim=-1)
 
-        token_ids = self.action_token_ids.to(device=device)
+        token_ids = self.action_token_ids.to(device=device).clone()
         token_embeds = F.embedding(token_ids, token_embedding_weight)
         token_embeds = token_embeds.to(dtype=dtype)
 
@@ -266,8 +268,18 @@ class RewardModel(transformers.PreTrainedModel):
         )
 
         if checkpoint_dir is not None:
-            reward_head_path = os.path.join(checkpoint_dir, "reward_head")
-            if os.path.exists(reward_head_path):
+            reward_head_candidates = [
+                os.path.join(checkpoint_dir, "reward_head"),
+                os.path.join(checkpoint_dir, "lora_adapter", "reward_head"),
+                os.path.join(checkpoint_dir, "adapter_model", "reward_head"),
+                os.path.join(
+                    checkpoint_dir, "lora_adapter", "adapter_model", "reward_head"
+                ),
+            ]
+            reward_head_path = next(
+                (p for p in reward_head_candidates if os.path.exists(p)), None
+            )
+            if reward_head_path is not None:
                 self.reward_head.load_state_dict(
                     torch.load(
                         reward_head_path,
@@ -275,7 +287,10 @@ class RewardModel(transformers.PreTrainedModel):
                     )
                 )
             else:
-                print(f"Warning: reward head not found at {reward_head_path}")
+                print(
+                    "Warning: reward head not found. Checked: "
+                    + ", ".join(reward_head_candidates)
+                )
 
         self.reward_head.requires_grad_(kwargs.get("is_trainable", True))
 
@@ -483,7 +498,8 @@ class RewardModelTrainer(transformers.Trainer):
         if hasattr(model, "action_soft_embedder"):
             amin = float(model.action_soft_embedder.action_value_min)
             amax = float(model.action_soft_embedder.action_value_max)
-            a_noise.data.clamp_(amin, amax)
+            with torch.no_grad():
+                a_noise.clamp_(amin, amax)
 
         out_s_n = model(
             input_ids=input_ids,

@@ -18,6 +18,8 @@ LM_MODEL_NAME=LLaVA-RLHF-7b-v1.5-224/sft_model/
 
 # DATA CONFIG
 PREFERENCE_DATA=action_preference_bridge/action_preference_bridge.json
+PREPROCESS_ACTION_DATA=${PREPROCESS_ACTION_DATA:-false}
+PREPROCESSED_DATA=action_preference_bridge/action_preference_bridge_continuous.json
 
 # SAVE CONFIG
 MODEL_NAME=Monkey-Verifier-7B-Energy
@@ -37,6 +39,26 @@ NUM_EPOCHS=1
 LEARNING_RATE=2e-5
 BATCH_SIZE=2
 GRAD_ACCUMULATION=4
+ACTION_VALUE_MIN=${ACTION_VALUE_MIN:--1.0}
+ACTION_VALUE_MAX=${ACTION_VALUE_MAX:-1.0}
+
+# Optional: build a continuous-action dataset from token-id actions before training.
+# This enforces the same domain for train/refine/token mapping.
+if [ "$PREPROCESS_ACTION_DATA" = "true" ]; then
+    python scripts/preprocess_action_dataset.py \
+        --input "$DATA_DIR/$PREFERENCE_DATA" \
+        --output "$DATA_DIR/$PREPROCESSED_DATA" \
+        --mode token_to_continuous \
+        --action_token_start 31744 \
+        --action_token_end 31999 \
+        --action_value_min -1.0 \
+        --action_value_max 1.0 \
+        --action_dim 7 \
+        --mapping_style openvla_digitize \
+        --keep_original \
+        --write_sidecar
+    PREFERENCE_DATA="$PREPROCESSED_DATA"
+fi
 
 torchrun \
     --standalone \
@@ -83,6 +105,8 @@ torchrun \
     --action_dim 7 \
     --action_token_start 31744 \
     --action_token_end 31999 \
+    --action_value_min $ACTION_VALUE_MIN \
+    --action_value_max $ACTION_VALUE_MAX \
     --reward_output_activation "softplus" \
     --energy_expand_pairwise_samples True \
     --bits 16 \
