@@ -482,6 +482,38 @@ def train():
             rank0_print("=" * 20)
             rank0_print("=" * 20)
 
+        # Guardrail: energy training expects continuous actions in action_value range.
+        if str(training_args.rm_loss_type) in ("energy", "energy_kd_score"):
+            action_min = (
+                float(training_args.action_value_min)
+                if training_args.action_value_min is not None
+                else -1.0
+            )
+            action_max = (
+                float(training_args.action_value_max)
+                if training_args.action_value_max is not None
+                else 1.0
+            )
+            sample_count = min(128, len(training_data))
+            out_of_range = 0
+            max_abs_action = 0.0
+            for i in range(sample_count):
+                a = training_data[i]["action_continuous"].float()
+                max_abs_action = max(max_abs_action, float(a.abs().max().item()))
+                if bool(((a < action_min) | (a > action_max)).any()):
+                    out_of_range += 1
+
+            if out_of_range > 0:
+                raise ValueError(
+                    "Detected out-of-range action_continuous values for energy training. "
+                    f"Range=[{action_min}, {action_max}], "
+                    f"out_of_range_samples={out_of_range}/{sample_count}, "
+                    f"max_abs_action={max_abs_action:.4f}. "
+                    "This usually means token IDs were fed as action_continuous. "
+                    "Please preprocess dataset to continuous domain (PREPROCESS_ACTION_DATA=true) "
+                    "or set dataset_path to *_continuous.json."
+                )
+
     config = RewardConfig(backbone_model_name_or_path=model_args.model_name_or_path)
 
     with DisableLogger():

@@ -408,6 +408,7 @@ class RewardModelTrainer(transformers.Trainer):
                 p.requires_grad_(False)
 
     def _compute_energy_kd_score_loss(self, model, inputs, return_outputs=False):
+        core_model = unwrap_model(model)
         input_ids, attention_mask, action_continuous, rmse = unpack_dict(
             inputs, keys=("input_ids","attention_mask","action_continuous","rmse")
         )
@@ -415,24 +416,25 @@ class RewardModelTrainer(transformers.Trainer):
 
         # ---- (A) get placeholder id
         action_placeholder_id = getattr(self.args, "action_placeholder_id", None)
-        if action_placeholder_id is None and hasattr(model, "action_placeholder_id"):
-            action_placeholder_id = model.action_placeholder_id
+        if action_placeholder_id is None and hasattr(core_model, "action_placeholder_id"):
+            action_placeholder_id = core_model.action_placeholder_id
 
         # ---- (B) sigma schedules (optional but recommended)
         # student sigma anneal
-        if hasattr(model, "action_soft_embedder"):
+        if hasattr(core_model, "action_soft_embedder"):
             s0 = float(getattr(self.args, "student_sigma_init", 0.0) or 0.0)
             s1 = float(getattr(self.args, "student_sigma_final", 0.0) or 0.0)
             T  = int(getattr(self.args, "sigma_anneal_steps", 0) or 0)
             if T > 0 and s0 > 0 and s1 > 0:
                 t = min(1.0, self.state.global_step / float(T))
-                model.action_soft_embedder._action_sigma = (1 - t) * s0 + t * s1
+                core_model.action_soft_embedder._action_sigma = (1 - t) * s0 + t * s1
 
         # teacher sigma tiny (hard-approx)
-        if self.teacher_model is not None and hasattr(self.teacher_model, "action_soft_embedder"):
+        teacher_core = unwrap_model(self.teacher_model) if self.teacher_model is not None else None
+        if teacher_core is not None and hasattr(teacher_core, "action_soft_embedder"):
             ts = float(getattr(self.args, "teacher_sigma", 0.0) or 0.0)
             if ts > 0:
-                self.teacher_model.action_soft_embedder._action_sigma = ts
+                teacher_core.action_soft_embedder._action_sigma = ts
 
         # ---- (C) forward on GT (student)
         a_gt = action_continuous
@@ -502,9 +504,9 @@ class RewardModelTrainer(transformers.Trainer):
         a_noise = (a_gt_f + noise_std * torch.randn_like(a_gt_f)).detach().requires_grad_(True)
 
         # clamp to embedder range if you set min/max (optional)
-        if hasattr(model, "action_soft_embedder"):
-            amin = float(model.action_soft_embedder.action_value_min)
-            amax = float(model.action_soft_embedder.action_value_max)
+        if hasattr(core_model, "action_soft_embedder"):
+            amin = float(core_model.action_soft_embedder.action_value_min)
+            amax = float(core_model.action_soft_embedder.action_value_max)
             with torch.no_grad():
                 a_noise.clamp_(amin, amax)
 
@@ -533,10 +535,13 @@ class RewardModelTrainer(transformers.Trainer):
         loss_score = torch.zeros([], device=E_s_gt.device)
         grad_norm = torch.zeros([], device=E_s_gt.device)
         target_grad_norm = torch.zeros([], device=E_s_gt.device)
+        sigma_val = None
+        if hasattr(core_model, "action_soft_embedder"):
+            sigma_val = getattr(core_model.action_soft_embedder, "_action_sigma", None)
         current_sigma = torch.tensor(
-            float(getattr(model.action_soft_embedder, "_action_sigma", 0.0) or 0.0),
+            float(sigma_val) if sigma_val is not None else -1.0,
             device=E_s_gt.device,
-        ) if hasattr(model, "action_soft_embedder") else torch.zeros([], device=E_s_gt.device)
+        )
 
         if torch.is_grad_enabled() and lambda_score > 0:
             grad_a = torch.autograd.grad(
