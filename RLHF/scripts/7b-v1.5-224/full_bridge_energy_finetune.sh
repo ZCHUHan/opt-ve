@@ -119,14 +119,14 @@ torchrun \
     --teacher_dir "$MODEL_DIR/$TEACHER_DIR" \
     --lambda_kd 1.0 \
     --lambda_local 1.0 \
-    --lambda_score 0.1 \
+    --lambda_score 0.01 \
     --teacher_sigma 0.005 \
-    --student_sigma_init 0.005 \
+    --student_sigma_init 0.02 \
     --student_sigma_final 0.05 \
-    --sigma_anneal_steps 2000 \
-    --noise_std 0.05 \
+    --sigma_anneal_steps 500 \
+    --noise_std 0.02 \
     --beta_dist 1.0 \
-    --score_sigma 0.05 \
+    --score_sigma 0.1 \
     --lambda_gp 0.1 \
     --gp_cap 1.0 \
     --action_placeholder_token "<ACT>" \

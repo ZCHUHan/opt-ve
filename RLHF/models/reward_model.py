@@ -449,6 +449,12 @@ class RewardModelTrainer(transformers.Trainer):
         rmse = rmse.to(device=E_s_gt.device)
         loss_main = F.smooth_l1_loss(E_s_gt.float(), rmse.float())
 
+        # Keep eval stable and interpretable: evaluate only pointwise energy fit.
+        if not model.training:
+            if return_outputs:
+                return loss_main, dict(logits=E_s_gt.detach().unsqueeze(-1))
+            return loss_main
+
         # ---- (D) KD on GT (teacher or offline teacher scores)
         lambda_kd = float(getattr(self.args, "lambda_kd", 0.0))
         loss_kd = torch.zeros([], device=E_s_gt.device)
@@ -526,6 +532,11 @@ class RewardModelTrainer(transformers.Trainer):
         lambda_score = float(getattr(self.args, "lambda_score", 0.0))
         loss_score = torch.zeros([], device=E_s_gt.device)
         grad_norm = torch.zeros([], device=E_s_gt.device)
+        target_grad_norm = torch.zeros([], device=E_s_gt.device)
+        current_sigma = torch.tensor(
+            float(getattr(model.action_soft_embedder, "_action_sigma", 0.0) or 0.0),
+            device=E_s_gt.device,
+        ) if hasattr(model, "action_soft_embedder") else torch.zeros([], device=E_s_gt.device)
 
         if torch.is_grad_enabled() and lambda_score > 0:
             grad_a = torch.autograd.grad(
@@ -542,6 +553,7 @@ class RewardModelTrainer(transformers.Trainer):
             sigma_n = float(getattr(self.args, "score_sigma", noise_std))
             sigma_n = max(sigma_n, 1e-6)
             target_grad = (a_noise - a_gt_f) / (sigma_n ** 2)
+            target_grad_norm = torch.norm(target_grad.float(), p=2, dim=-1).mean()
 
             loss_score = F.mse_loss(grad_a, target_grad)
 
@@ -574,6 +586,8 @@ class RewardModelTrainer(transformers.Trainer):
             "loss_score": loss_score.detach(),
             "loss_gp": loss_gp.detach(),
             "grad_norm_mean": grad_norm.detach(),
+            "target_grad_norm_mean": target_grad_norm.detach(),
+            "student_sigma": current_sigma.detach(),
         }
         # Keep component logs for training diagnostics, but do not expose them
         # as prediction tensors (it breaks eval collation due heterogeneous shapes).
