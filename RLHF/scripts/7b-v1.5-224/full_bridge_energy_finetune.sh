@@ -17,9 +17,9 @@ VISION_TOWER=openai/clip-vit-large-patch14-336
 LM_MODEL_NAME=LLaVA-RLHF-7b-v1.5-224/sft_model/
 
 # DATA CONFIG
-PREFERENCE_DATA=action_preference_bridge/action_preference_bridge.json
+PREFERENCE_DATA=action_preference_bridge/action_preference_bridge_mini_50k.json
 PREPROCESS_ACTION_DATA=${PREPROCESS_ACTION_DATA:-false}
-PREPROCESSED_DATA=action_preference_bridge/action_preference_bridge_continuous.json
+PREPROCESSED_DATA=action_preference_bridge/action_preference_bridge_mini_50k_continuous.json
 
 # SAVE CONFIG
 MODEL_NAME=Monkey-Verifier-7B-Energy
