@@ -28,6 +28,9 @@ MODEL_NAME=Monkey-Verifier-7B-Energy
 TEACHER_DIR=Monkey-Verifier-teacher
 # Optional: precomputed teacher scores for offline KD (set after running cache_teacher_scores.py)
 # TEACHER_SCORE_PATH=$MODEL_DIR/Monkey-Verifier-7B-Energy/teacher_scores.pt
+AUTO_ALIGN_TEACHER_SCORE_SIGN=${AUTO_ALIGN_TEACHER_SCORE_SIGN:-true}
+TEACHER_SCORE_SIGN_STRICT=${TEACHER_SCORE_SIGN_STRICT:-true}
+TEACHER_SCORE_MIN_ABS_CORR=${TEACHER_SCORE_MIN_ABS_CORR:-0.02}
 
 # WANDB CONFIG
 export WANDB_PROJECT="bridge-energy"
@@ -58,6 +61,31 @@ if [ "$PREPROCESS_ACTION_DATA" = "true" ]; then
         --keep_original \
         --write_sidecar
     PREFERENCE_DATA="$PREPROCESSED_DATA"
+fi
+
+# Automatically align offline teacher score sign to energy semantics:
+# ensure corr(teacher_score, rmse) >= 0 (flip if needed).
+if [ -n "${TEACHER_SCORE_PATH:-}" ] && [ "$AUTO_ALIGN_TEACHER_SCORE_SIGN" = "true" ]; then
+    if [[ "$TEACHER_SCORE_PATH" == *.pt ]]; then
+        TEACHER_SCORE_PATH_ALIGNED="${TEACHER_SCORE_PATH%.pt}.energy_aligned.pt"
+    else
+        TEACHER_SCORE_PATH_ALIGNED="${TEACHER_SCORE_PATH}.energy_aligned.pt"
+    fi
+
+    ALIGN_CMD=(
+        python scripts/align_teacher_scores_sign.py
+        --dataset_path "$DATA_DIR/$PREFERENCE_DATA"
+        --teacher_scores "$TEACHER_SCORE_PATH"
+        --output "$TEACHER_SCORE_PATH_ALIGNED"
+        --energy_expand_pairwise_samples
+        --min_abs_corr "$TEACHER_SCORE_MIN_ABS_CORR"
+    )
+    if [ "$TEACHER_SCORE_SIGN_STRICT" = "true" ]; then
+        ALIGN_CMD+=(--strict)
+    fi
+
+    "${ALIGN_CMD[@]}"
+    TEACHER_SCORE_PATH="$TEACHER_SCORE_PATH_ALIGNED"
 fi
 
 torchrun \
