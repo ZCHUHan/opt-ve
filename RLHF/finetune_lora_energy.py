@@ -275,6 +275,95 @@ def rank0_print(*args):
         print(*args)
 
 
+def _score_mode_from_loss_type(rm_loss_type: str) -> str:
+    if rm_loss_type in ("energy", "energy_kd_score"):
+        return "energy"
+    return "reward"
+
+
+def save_inference_consistency_config(
+    output_dir: str,
+    args: argparse.Namespace,
+    data_args: DataArguments,
+    training_args: TrainingArguments,
+    action_placeholder_id: int,
+):
+    action_token_start = int(training_args.action_token_start)
+    action_token_end = int(training_args.action_token_end)
+    diff_action_bins = action_token_end - action_token_start + 1
+    if diff_action_bins <= 0:
+        raise ValueError(
+            f"Invalid action token range: [{action_token_start}, {action_token_end}]"
+        )
+
+    action_min = (
+        float(training_args.action_value_min)
+        if training_args.action_value_min is not None
+        else -1.0
+    )
+    action_max = (
+        float(training_args.action_value_max)
+        if training_args.action_value_max is not None
+        else 1.0
+    )
+    if action_max <= action_min:
+        raise ValueError(
+            f"Invalid action value range: min={action_min}, max={action_max}"
+        )
+
+    score_mode = _score_mode_from_loss_type(str(training_args.rm_loss_type))
+    consistency_cfg = {
+        # Source/runtime metadata.
+        "model_name_or_path": str(args.model_name_or_path),
+        "rm_loss_type": str(training_args.rm_loss_type),
+        "reward_output_activation": str(training_args.reward_output_activation),
+        "diff_reward_activation": str(training_args.reward_output_activation),
+        "diff_score_mode": score_mode,
+        # Placeholder consistency (A1).
+        "action_placeholder_token": str(data_args.action_placeholder_token),
+        "action_placeholder_id": int(action_placeholder_id),
+        # Action token/bin consistency (A2).
+        "action_dim": int(data_args.action_dim),
+        "action_token_start": action_token_start,
+        "action_token_end": action_token_end,
+        "diff_action_bins": int(diff_action_bins),
+        "diff_action_min": action_min,
+        "diff_action_max": action_max,
+        "diff_action_token_ids": list(range(action_token_start, action_token_end + 1)),
+        "diff_action_sigma": float(training_args.student_sigma_final),
+        "diff_action_strict_token_check": True,
+        "diff_action_log_diagnostics": True,
+        # Data/prompt consistency hints.
+        "energy_expand_pairwise_samples": bool(
+            getattr(data_args, "energy_expand_pairwise_samples", True)
+        ),
+        "image_aspect_ratio": str(data_args.image_aspect_ratio),
+        "query_len": int(training_args.query_len)
+        if training_args.query_len is not None
+        else None,
+        "response_len": int(training_args.response_len)
+        if training_args.response_len is not None
+        else None,
+    }
+
+    serializable_args = {
+        k: v
+        for k, v in vars(args).items()
+        if isinstance(v, (str, int, float, bool, list, dict)) or v is None
+    }
+
+    os.makedirs(output_dir, exist_ok=True)
+    consistency_path = os.path.join(output_dir, "inference_consistency_config.json")
+    args_path = os.path.join(output_dir, "training_args_snapshot.json")
+    with open(consistency_path, "w") as fout:
+        json.dump(consistency_cfg, fout, indent=2)
+    with open(args_path, "w") as fout:
+        json.dump(serializable_args, fout, indent=2)
+
+    rank0_print(f"Saved inference consistency config: {consistency_path}")
+    rank0_print(f"Saved training args snapshot: {args_path}")
+
+
 def train():
     hfparser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments)
@@ -428,6 +517,13 @@ def train():
 
     model.backbone_model.config.use_cache = False
     model.action_placeholder_id = action_placeholder_id
+    save_inference_consistency_config(
+        output_dir=args.output_dir,
+        args=args,
+        data_args=data_args,
+        training_args=training_args,
+        action_placeholder_id=action_placeholder_id,
+    )
     print_trainable_parameters(args, model)
     print("loaded model")
     set_seed(args.seed)

@@ -115,7 +115,9 @@ def main():
         config=cfg,
         checkpoint_dir=args.teacher_ckpt,
         tokenizer=tokenizer,
-        qlora=(args.bits in (4, 8)),
+        # Keep consistent with finetune_lora_energy.py: make_generative_vlm
+        # currently only implements the qlora=True branch.
+        qlora=True,
         is_trainable=False,
         action_dim=args.action_dim,
         action_placeholder_id=action_placeholder_id,
