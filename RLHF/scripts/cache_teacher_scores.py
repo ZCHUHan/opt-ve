@@ -23,6 +23,35 @@ class IndexDataset(Dataset):
         ex["idx"] = torch.tensor(idx, dtype=torch.long)
         return ex
 
+
+def _collect_placeholder_id_candidates(tokenizer, placeholder_token: str):
+    """Collect plausible ids for placeholder across raw/SP/context tokenization."""
+    candidates = set()
+    unk_id = int(tokenizer.unk_token_id)
+
+    raw_id = tokenizer.convert_tokens_to_ids(placeholder_token)
+    if raw_id is not None and int(raw_id) != unk_id:
+        candidates.add(int(raw_id))
+
+    if not placeholder_token.startswith("▁"):
+        sp_id = tokenizer.convert_tokens_to_ids("▁" + placeholder_token)
+        if sp_id is not None and int(sp_id) != unk_id:
+            candidates.add(int(sp_id))
+
+    try:
+        context_ids = tokenizer(
+            f" {placeholder_token} ", add_special_tokens=False
+        ).input_ids
+        space_ids = set(tokenizer(" ", add_special_tokens=False).input_ids)
+        for tid in context_ids:
+            if int(tid) != unk_id and int(tid) not in space_ids:
+                candidates.add(int(tid))
+    except Exception:
+        pass
+
+    return sorted(candidates)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--teacher_ckpt", required=True, help="teacher checkpoint_dir")
@@ -82,11 +111,14 @@ def main():
 
     # Legacy RM compatibility: fixed token/id expected by the original pipeline.
     action_placeholder_id = int(args.action_placeholder_id)
-    legacy_id = tokenizer.convert_tokens_to_ids(args.action_placeholder_token)
-    if legacy_id != action_placeholder_id:
+    candidate_ids = _collect_placeholder_id_candidates(
+        tokenizer, args.action_placeholder_token
+    )
+    if action_placeholder_id not in candidate_ids:
         raise ValueError(
-            f"Expected placeholder token '{args.action_placeholder_token}' to map to "
-            f"id {action_placeholder_id}, got {legacy_id}."
+            "Expected placeholder id not found in tokenizer candidates. "
+            f"token='{args.action_placeholder_token}', "
+            f"expected_id={action_placeholder_id}, candidates={candidate_ids}."
         )
     if (args.action_token_end - args.action_token_offset) < (
         args.action_token_start - args.action_token_offset

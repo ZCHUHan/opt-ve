@@ -276,6 +276,34 @@ def rank0_print(*args):
         print(*args)
 
 
+def _collect_placeholder_id_candidates(tokenizer, placeholder_token: str) -> List[int]:
+    """Collect plausible ids for placeholder across raw/SP/context tokenization."""
+    candidates = set()
+    unk_id = int(tokenizer.unk_token_id)
+
+    raw_id = tokenizer.convert_tokens_to_ids(placeholder_token)
+    if raw_id is not None and int(raw_id) != unk_id:
+        candidates.add(int(raw_id))
+
+    if not placeholder_token.startswith("▁"):
+        sp_id = tokenizer.convert_tokens_to_ids("▁" + placeholder_token)
+        if sp_id is not None and int(sp_id) != unk_id:
+            candidates.add(int(sp_id))
+
+    try:
+        context_ids = tokenizer(
+            f" {placeholder_token} ", add_special_tokens=False
+        ).input_ids
+        space_ids = set(tokenizer(" ", add_special_tokens=False).input_ids)
+        for tid in context_ids:
+            if int(tid) != unk_id and int(tid) not in space_ids:
+                candidates.add(int(tid))
+    except Exception:
+        pass
+
+    return sorted(candidates)
+
+
 def _score_mode_from_loss_type(rm_loss_type: str) -> str:
     if rm_loss_type in ("energy", "energy_kd_score"):
         return "energy"
@@ -440,11 +468,14 @@ def train():
     # This keeps behavior aligned with finetune_lora_rm.py + common_utils.preprocess().
     data_args.action_placeholder_token = "placeholder"
     action_placeholder_id = 12983
-    legacy_id = tokenizer.convert_tokens_to_ids(data_args.action_placeholder_token)
-    if legacy_id != action_placeholder_id:
+    candidate_ids = _collect_placeholder_id_candidates(
+        tokenizer, data_args.action_placeholder_token
+    )
+    if action_placeholder_id not in candidate_ids:
         raise ValueError(
-            "Legacy placeholder mismatch: expected token 'placeholder' to map to id 12983, "
-            f"got {legacy_id}. Please use the original tokenizer/checkpoint family."
+            "Legacy placeholder mismatch: expected placeholder id 12983 not found in "
+            f"tokenizer candidates for token '{data_args.action_placeholder_token}'. "
+            f"candidates={candidate_ids}. Please verify tokenizer/checkpoint family."
         )
     training_args.action_placeholder_id = action_placeholder_id
     args.action_placeholder_id = action_placeholder_id
