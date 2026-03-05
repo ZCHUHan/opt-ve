@@ -153,8 +153,8 @@ class ActionSoftEmbedder(nn.Module):
     def __init__(
         self,
         action_dim: int = 7,
-        action_token_start: int = 31744,
-        action_token_end: int = 31999,
+        action_token_start: int = 30744,
+        action_token_end: int = 30999,
         action_value_min: Optional[float] = None,
         action_value_max: Optional[float] = None,
         action_sigma: Optional[float] = None,
@@ -261,8 +261,8 @@ class RewardModel(transformers.PreTrainedModel):
         self.action_placeholder_id = kwargs.get("action_placeholder_id", None)
         self.action_soft_embedder = ActionSoftEmbedder(
             action_dim=kwargs.get("action_dim", 7),
-            action_token_start=kwargs.get("action_token_start", 31744),
-            action_token_end=kwargs.get("action_token_end", 31999),
+            action_token_start=kwargs.get("action_token_start", 30744),
+            action_token_end=kwargs.get("action_token_end", 30999),
             action_value_min=kwargs.get("action_value_min", None),
             action_value_max=kwargs.get("action_value_max", None),
             action_sigma=kwargs.get("action_sigma", None),
@@ -823,8 +823,8 @@ def load_4bit_reward_model_for_inference(
     trust_remote_code=False,
     reward_output_activation: str = "identity",
     action_dim: int = 7,
-    action_token_start: int = 31744,
-    action_token_end: int = 31999,
+    action_token_start: int = 30744,
+    action_token_end: int = 30999,
     action_value_min: Optional[float] = None,
     action_value_max: Optional[float] = None,
     action_sigma: Optional[float] = None,

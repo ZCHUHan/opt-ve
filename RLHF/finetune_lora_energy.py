@@ -93,7 +93,7 @@ class DataArguments:
     reward_prompt_file: Optional[str] = field(default=None)
     image_to_caption_file: Optional[str] = field(default=None)
     action_dim: int = field(default=7)
-    action_placeholder_token: str = field(default="<ACT>")
+    action_placeholder_token: str = field(default="placeholder")
     energy_expand_pairwise_samples: bool = field(default=True)
     # Optional: path to pre-computed teacher scores for offline KD.
     teacher_score_path: Optional[str] = field(
@@ -262,6 +262,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     lambda_gp: float = field(default=0.1)
     gp_cap: float = field(default=1.0)
     action_placeholder_id: Optional[int] = field(default=None)
+    action_token_offset: int = field(default=1000)
     action_token_start: int = field(default=31744)
     action_token_end: int = field(default=31999)
     action_value_min: Optional[float] = field(default=None)
@@ -290,6 +291,9 @@ def save_inference_consistency_config(
 ):
     action_token_start = int(training_args.action_token_start)
     action_token_end = int(training_args.action_token_end)
+    action_token_offset = int(getattr(training_args, "action_token_offset", 1000))
+    model_action_token_start = action_token_start - action_token_offset
+    model_action_token_end = action_token_end - action_token_offset
     diff_action_bins = action_token_end - action_token_start + 1
     if diff_action_bins <= 0:
         raise ValueError(
@@ -324,12 +328,17 @@ def save_inference_consistency_config(
         "action_placeholder_id": int(action_placeholder_id),
         # Action token/bin consistency (A2).
         "action_dim": int(data_args.action_dim),
-        "action_token_start": action_token_start,
-        "action_token_end": action_token_end,
+        "action_token_offset": action_token_offset,
+        "raw_action_token_start": action_token_start,
+        "raw_action_token_end": action_token_end,
+        "action_token_start": model_action_token_start,
+        "action_token_end": model_action_token_end,
         "diff_action_bins": int(diff_action_bins),
         "diff_action_min": action_min,
         "diff_action_max": action_max,
-        "diff_action_token_ids": list(range(action_token_start, action_token_end + 1)),
+        "diff_action_token_ids": list(
+            range(model_action_token_start, model_action_token_end + 1)
+        ),
         "diff_action_sigma": float(training_args.student_sigma_final),
         "diff_action_strict_token_check": True,
         "diff_action_log_diagnostics": True,
@@ -427,17 +436,15 @@ def train():
                 "vicuna_v1"
             ]
 
-    num_added_action_tokens = 0
-    if data_args.action_placeholder_token not in tokenizer.get_vocab():
-        num_added_action_tokens = tokenizer.add_special_tokens(
-            {"additional_special_tokens": [data_args.action_placeholder_token]}
-        )
-    action_placeholder_id = tokenizer.convert_tokens_to_ids(
-        data_args.action_placeholder_token
-    )
-    if action_placeholder_id == tokenizer.unk_token_id:
+    # Legacy RM compatibility: use fixed placeholder token/id from the original pipeline.
+    # This keeps behavior aligned with finetune_lora_rm.py + common_utils.preprocess().
+    data_args.action_placeholder_token = "placeholder"
+    action_placeholder_id = 12983
+    legacy_id = tokenizer.convert_tokens_to_ids(data_args.action_placeholder_token)
+    if legacy_id != action_placeholder_id:
         raise ValueError(
-            f"Action placeholder token {data_args.action_placeholder_token} is unknown to tokenizer."
+            "Legacy placeholder mismatch: expected token 'placeholder' to map to id 12983, "
+            f"got {legacy_id}. Please use the original tokenizer/checkpoint family."
         )
     training_args.action_placeholder_id = action_placeholder_id
     args.action_placeholder_id = action_placeholder_id
@@ -514,6 +521,18 @@ def train():
                     "or set dataset_path to *_continuous.json."
                 )
 
+    model_action_token_start = int(training_args.action_token_start) - int(
+        training_args.action_token_offset
+    )
+    model_action_token_end = int(training_args.action_token_end) - int(
+        training_args.action_token_offset
+    )
+    if model_action_token_end < model_action_token_start:
+        raise ValueError(
+            "Invalid model action token range after applying offset: "
+            f"[{model_action_token_start}, {model_action_token_end}]"
+        )
+
     config = RewardConfig(backbone_model_name_or_path=model_args.model_name_or_path)
 
     with DisableLogger():
@@ -525,27 +544,12 @@ def train():
             tokenizer=tokenizer,
             action_dim=data_args.action_dim,
             action_placeholder_id=action_placeholder_id,
-            action_token_start=training_args.action_token_start,
-            action_token_end=training_args.action_token_end,
+            action_token_start=model_action_token_start,
+            action_token_end=model_action_token_end,
             action_value_min=training_args.action_value_min,
             action_value_max=training_args.action_value_max,
             reward_output_activation=training_args.reward_output_activation,
         ).to(torch.bfloat16)
-
-    if num_added_action_tokens > 0:
-        model.backbone_model.resize_token_embeddings(len(tokenizer))
-        input_embeddings = model.backbone_model.get_input_embeddings().weight.data
-        input_embeddings_avg = input_embeddings[:-num_added_action_tokens].mean(
-            dim=0, keepdim=True
-        )
-        input_embeddings[-num_added_action_tokens:] = input_embeddings_avg
-        output_embeddings = model.backbone_model.get_output_embeddings()
-        if output_embeddings is not None:
-            output_embeddings_weight = output_embeddings.weight.data
-            output_embeddings_avg = output_embeddings_weight[
-                :-num_added_action_tokens
-            ].mean(dim=0, keepdim=True)
-            output_embeddings_weight[-num_added_action_tokens:] = output_embeddings_avg
 
     model.backbone_model.config.use_cache = False
     model.action_placeholder_id = action_placeholder_id
@@ -578,31 +582,13 @@ def train():
             tokenizer=tokenizer,
             action_dim=data_args.action_dim,
             action_placeholder_id=action_placeholder_id,
-            action_token_start=training_args.action_token_start,
-            action_token_end=training_args.action_token_end,
+            action_token_start=model_action_token_start,
+            action_token_end=model_action_token_end,
             action_value_min=training_args.action_value_min,
             action_value_max=training_args.action_value_max,
             reward_output_activation=training_args.reward_output_activation,
             is_trainable=False,
         ).to(torch.bfloat16)
-
-        # Resize teacher model's token embeddings to match tokenizer (in case new tokens were added)
-        if num_added_action_tokens > 0:
-            teacher.backbone_model.resize_token_embeddings(len(tokenizer))
-            input_embeddings = teacher.backbone_model.get_input_embeddings().weight.data
-            input_embeddings_avg = input_embeddings[:-num_added_action_tokens].mean(
-                dim=0, keepdim=True
-            )
-            input_embeddings[-num_added_action_tokens:] = input_embeddings_avg
-            output_embeddings = teacher.backbone_model.get_output_embeddings()
-            if output_embeddings is not None:
-                output_embeddings_weight = output_embeddings.weight.data
-                output_embeddings_avg = output_embeddings_weight[
-                    :-num_added_action_tokens
-                ].mean(dim=0, keepdim=True)
-                output_embeddings_weight[-num_added_action_tokens:] = (
-                    output_embeddings_avg
-                )
 
         teacher.eval()
         for p in teacher.parameters():

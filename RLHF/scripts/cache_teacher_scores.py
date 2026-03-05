@@ -34,7 +34,9 @@ def main():
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--action_dim", type=int, default=7)
-    ap.add_argument("--action_placeholder_token", default="<ACT>")
+    ap.add_argument("--action_placeholder_token", default="placeholder")
+    ap.add_argument("--action_placeholder_id", type=int, default=12983)
+    ap.add_argument("--action_token_offset", type=int, default=1000)
     ap.add_argument("--action_token_start", type=int, default=31744)
     ap.add_argument("--action_token_end", type=int, default=31999)
     ap.add_argument("--action_value_min", type=float, default=-1.0)
@@ -78,15 +80,22 @@ def main():
             "vicuna_v1"
         ]
 
-    # ensure <ACT> exists (same logic as finetune script)
-    num_added = 0
-    if args.action_placeholder_token not in tokenizer.get_vocab():
-        num_added = tokenizer.add_special_tokens(
-            {"additional_special_tokens": [args.action_placeholder_token]}
+    # Legacy RM compatibility: fixed token/id expected by the original pipeline.
+    action_placeholder_id = int(args.action_placeholder_id)
+    legacy_id = tokenizer.convert_tokens_to_ids(args.action_placeholder_token)
+    if legacy_id != action_placeholder_id:
+        raise ValueError(
+            f"Expected placeholder token '{args.action_placeholder_token}' to map to "
+            f"id {action_placeholder_id}, got {legacy_id}."
         )
-    action_placeholder_id = tokenizer.convert_tokens_to_ids(args.action_placeholder_token)
-    if action_placeholder_id == tokenizer.unk_token_id:
-        raise ValueError("placeholder token is unk. tokenizer/add_special_tokens failed.")
+    if (args.action_token_end - args.action_token_offset) < (
+        args.action_token_start - args.action_token_offset
+    ):
+        raise ValueError(
+            "Invalid action token range after applying offset: "
+            f"[{args.action_token_start - args.action_token_offset}, "
+            f"{args.action_token_end - args.action_token_offset}]"
+        )
 
     # 2) load teacher model ONLY
     cfg = RewardConfig(backbone_model_name_or_path=args.model_name_or_path)
@@ -107,8 +116,8 @@ def main():
         full_finetune=False,
         gradient_checkpointing=False,
         action_placeholder_id=action_placeholder_id,
-        action_token_start=args.action_token_start,
-        action_token_end=args.action_token_end,
+        action_token_start=args.action_token_start - args.action_token_offset,
+        action_token_end=args.action_token_end - args.action_token_offset,
         action_value_min=args.action_value_min,
         action_value_max=args.action_value_max,
         reward_output_activation="identity",  # teacher_score 用 raw 更稳
@@ -131,14 +140,6 @@ def main():
         action_value_max=rm_args.action_value_max,
         reward_output_activation=rm_args.reward_output_activation,
     )
-
-    # resize embeddings if we added <ACT>
-    if num_added > 0:
-        teacher.backbone_model.resize_token_embeddings(len(tokenizer))
-        # init new token embedding as avg (same as your finetune script)
-        emb = teacher.backbone_model.get_input_embeddings().weight.data
-        emb_avg = emb[:-num_added].mean(dim=0, keepdim=True)
-        emb[-num_added:] = emb_avg
 
     teacher.eval()
     for p in teacher.parameters():

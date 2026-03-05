@@ -129,13 +129,15 @@ torchrun \
     --score_sigma 0.1 \
     --lambda_gp 0.1 \
     --gp_cap 1.0 \
-    --action_placeholder_token "<ACT>" \
+    --action_placeholder_token "placeholder" \
+    --action_placeholder_id 12983 \
+    --action_token_offset 1000 \
     --action_dim 7 \
     --action_token_start 31744 \
     --action_token_end 31999 \
     --action_value_min $ACTION_VALUE_MIN \
     --action_value_max $ACTION_VALUE_MAX \
-    --reward_output_activation "softplus" \
+    --reward_output_activation "identity" \
     --energy_expand_pairwise_samples True \
     --bits 16 \
     --lora_r 512 \

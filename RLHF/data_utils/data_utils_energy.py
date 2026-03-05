@@ -136,7 +136,7 @@ class EnergyRewardModelingDataset(Dataset):
 
         self.action_dim = getattr(data_args, "action_dim", 7)
         self.action_placeholder_token = getattr(
-            data_args, "action_placeholder_token", "<ACT>"
+            data_args, "action_placeholder_token", "placeholder"
         )
         self.expand_pairwise_samples = getattr(
             data_args, "energy_expand_pairwise_samples", True
